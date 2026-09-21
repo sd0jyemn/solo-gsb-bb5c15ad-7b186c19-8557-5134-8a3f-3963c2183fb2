@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from . import service
 from .db import get_db, init_db
 from .schemas import (
+    BatchPreviewOut,
     BatchTransferIn,
     BatchTransferOut,
     ContainerIn,
@@ -32,6 +33,7 @@ app = FastAPI(
     description=(
         "登记带体积的初始样品后，批量提交依次发生的容器间转移；"
         "每次按源容器当时的混合比例传播全部祖先来源（Decimal 精确计算）。"
+        "支持 /transfers/preview 预演：与真实提交同一套校验与分摊，但不落库。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -89,6 +91,19 @@ def batch_transfers(
     triples = [(t.source, t.destination, t.volume) for t in body.transfers]
     applied = service.apply_transfers(conn, triples)
     return {"applied": applied, "message": f"已依次提交 {applied} 条转移"}
+
+
+@app.post(
+    "/transfers/preview",
+    response_model=BatchPreviewOut,
+    tags=["transfers"],
+    summary="预演批量转移（不落库）",
+)
+def preview_transfers(
+    body: BatchTransferIn, conn: sqlite3.Connection = Depends(get_db)
+) -> dict:
+    triples = [(t.source, t.destination, t.volume) for t in body.transfers]
+    return service.preview_transfers(conn, triples)
 
 
 @app.get(

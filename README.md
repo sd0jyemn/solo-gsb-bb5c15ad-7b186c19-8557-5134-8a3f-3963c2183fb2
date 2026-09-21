@@ -9,6 +9,8 @@
 - 一批转移**严格依次发生**：后面的转移能看到同批中前面转移的结果。
 - 整批是一个 SQLite 事务：**源液不足、未知容器、自转移**（或任何参数错误）都会导致
   **整批拒绝、状态完全不变**。
+- 可用 `POST /transfers/preview` **预演**同一批转移：与真实提交完全相同的校验与分摊规则，
+  返回每一步的扣取明细与受影响容器的最终状态，但**绝不写入数据库**。
 - 可查询任一容器的**当前体积**以及各祖先初始样品的**来源占比**。
 
 ---
@@ -122,7 +124,70 @@ curl -X POST http://localhost:8000/transfers/batch \
 {"error":{"code":"insufficient_volume","message":"第 2 条转移源液不足：'V1' 当前 75.000000000，请求 9999.000000000，整批拒绝"}}
 ```
 
-### 4. 查询容器当前体积与来源占比
+### 4. 预演批量转移（不落库）
+
+`POST /transfers/preview` 使用与批量提交**完全相同的请求结构**，在数据库当前状态上
+按数组顺序整批模拟（链式转移使用本批前序模拟结果），返回：
+
+- `steps`：每一步的**条目序号**与从各祖先来源**实际扣取的精确份额**（`taken` 之和
+  精确等于该步请求体积，同样采用最大余额法）；
+- `containers`：全部受影响容器（本批所有源 / 目标容器）在预演结束时的**最终体积与
+  来源构成**，结构与 `GET /containers/{id}` 一致。
+
+预演与真实提交**共用同一套校验与分摊代码**：失败时返回的 HTTP 状态码、`error.code`
+以及消息中的条目序号（“第 N 条转移”）与 `/transfers/batch` 完全一致。预演只读不写，
+**成功或失败都不会改变数据库**，可以安全地重复调用。
+
+```bash
+curl -X POST http://localhost:8000/transfers/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"transfers":[
+    {"source":"S1","destination":"V1","volume":"40"},
+    {"source":"S2","destination":"V1","volume":"60"},
+    {"source":"V1","destination":"V2","volume":"25"}
+  ]}'
+```
+
+```json
+{
+  "steps": [
+    {"index": 1, "source": "S1", "destination": "V1", "volume": "40.000000000",
+     "taken": [{"source_id": "S1", "amount": "40.000000000"}]},
+    {"index": 2, "source": "S2", "destination": "V1", "volume": "60.000000000",
+     "taken": [{"source_id": "S2", "amount": "60.000000000"}]},
+    {"index": 3, "source": "V1", "destination": "V2", "volume": "25.000000000",
+     "taken": [
+       {"source_id": "S1", "amount": "10.000000000"},
+       {"source_id": "S2", "amount": "15.000000000"}
+     ]}
+  ],
+  "containers": [
+    {"container_id": "S1", "volume": "60.000000000",
+     "sources": [{"source_id": "S1", "amount": "60.000000000", "proportion": "1.000000"}],
+     "proportion_scale": 6},
+    {"container_id": "S2", "volume": "40.000000000",
+     "sources": [{"source_id": "S2", "amount": "40.000000000", "proportion": "1.000000"}],
+     "proportion_scale": 6},
+    {"container_id": "V1", "volume": "75.000000000",
+     "sources": [
+       {"source_id": "S1", "amount": "30.000000000", "proportion": "0.400000"},
+       {"source_id": "S2", "amount": "45.000000000", "proportion": "0.600000"}
+     ],
+     "proportion_scale": 6},
+    {"container_id": "V2", "volume": "25.000000000",
+     "sources": [
+       {"source_id": "S1", "amount": "10.000000000", "proportion": "0.400000"},
+       {"source_id": "S2", "amount": "15.000000000", "proportion": "0.600000"}
+     ],
+     "proportion_scale": 6}
+  ]
+}
+```
+
+上例中第 3 步从混合容器 `V1` 取 25：预演按前两步形成的 40/60 混合比分摊为
+S1 取 10、S2 取 15；调用后数据库中 S1/S2 仍为 100、V1/V2 仍为空。
+
+### 5. 查询容器当前体积与来源占比
 
 ```bash
 curl http://localhost:8000/containers/V1
