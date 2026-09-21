@@ -8,6 +8,8 @@
 * 一批转移严格“依次”发生（后面的转移能看到前面转移的结果）。
 * 任一转移失败（未知容器 / 自转移 / 源液不足 / 参数非法），整批拒绝，
   数据库状态完全不变（单个事务回滚）。
+* ``preview_transfers`` 与真实提交共用同一套校验与最大余额分摊实现，
+  在数据库当前状态上模拟整批并返回逐步明细；无论成功或失败都不写库。
 """
 from __future__ import annotations
 
@@ -157,16 +159,12 @@ def register_empty_container(conn: sqlite3.Connection, cid: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 批量转移
+# 批量转移（真实提交与预演共用同一套校验与分摊）
 # --------------------------------------------------------------------------- #
-def apply_transfers(
-    conn: sqlite3.Connection, transfers: Iterable[tuple[str, str, Decimal]]
-) -> int:
-    """依次执行一批转移，全部成功才提交，任一失败整批回滚。
-
-    返回执行的转移条数。
-    """
-    # 预先校验、量化体积累积（任何失败都在事务开始之前，状态必然不变）
+def _prepare_transfers(
+    transfers: Iterable[tuple[str, str, Decimal]]
+) -> list[tuple[str, str, Decimal]]:
+    """预先校验、量化每条转移的体积（任何失败都在事务开始之前，状态必然不变）。"""
     prepared: list[tuple[str, str, Decimal]] = []
     for index, (src, dst, raw_volume) in enumerate(transfers):
         volume = parse_volume(raw_volume, f"第 {index + 1} 条转移的 volume")
@@ -181,55 +179,85 @@ def apply_transfers(
                 f"第 {index + 1} 条转移为自转移：'{src}' -> '{src}'，整批拒绝",
             )
         prepared.append((src, dst, volume))
+    return prepared
 
+
+def _simulate_transfers(
+    conn: sqlite3.Connection, prepared: list[tuple[str, str, Decimal]]
+) -> tuple[dict[str, State], list[dict[str, Decimal]]]:
+    """在内存中按数组顺序依次模拟一批转移（只读数据库，自身不写回）。
+
+    链式转移看到本批前序步骤的模拟结果。返回：
+
+    * ``touched``：全部被触碰容器模拟后的状态；
+    * ``taken_steps``：每条转移按最大余额法从各祖先来源实际扣取的份额。
+
+    真实提交与预演都调用本函数，因此校验规则、错误码与条目序号完全一致。
+    """
     touched: dict[str, State] = {}
+    taken_steps: list[dict[str, Decimal]] = []
+
+    for index, (src, dst, volume) in enumerate(prepared, start=1):
+        # 未知容器（初始样品与空容器都在 containers 表中）
+        for cid in (src, dst):
+            if cid not in touched:
+                state = _load_state(conn, cid)
+                if state is None:
+                    raise LineageError(
+                        404,
+                        "unknown_container",
+                        f"第 {index} 条转移中的容器 '{cid}' 不存在，整批拒绝",
+                    )
+                touched[cid] = state
+
+        src_state = touched[src]
+        dst_state = touched[dst]
+        src_total = sum(src_state.values(), Decimal(0))
+
+        if volume == 0:
+            raise LineageError(
+                422,
+                "invalid_volume",
+                f"第 {index} 条转移体积必须大于 0，整批拒绝",
+            )
+        if volume > src_total:
+            raise LineageError(
+                422,
+                "insufficient_volume",
+                (
+                    f"第 {index} 条转移源液不足：'{src}' 当前 {src_total}，"
+                    f"请求 {volume}，整批拒绝"
+                ),
+            )
+
+        # 按源容器“当时”的混合比例取出全部祖先来源
+        with localcontext() as ctx:
+            ctx.prec = settings.decimal_precision
+            taken = apportion(volume, src_state)
+
+        for sid, amount in taken.items():
+            src_state[sid] -= amount
+            dst_state[sid] = dst_state.get(sid, Decimal(0)) + amount
+            if src_state[sid] == 0:
+                del src_state[sid]
+
+        taken_steps.append(taken)
+
+    return touched, taken_steps
+
+
+def apply_transfers(
+    conn: sqlite3.Connection, transfers: Iterable[tuple[str, str, Decimal]]
+) -> int:
+    """依次执行一批转移，全部成功才提交，任一失败整批回滚。
+
+    返回执行的转移条数。
+    """
+    prepared = _prepare_transfers(transfers)
 
     conn.execute("BEGIN")
     try:
-        for index, (src, dst, volume) in enumerate(prepared, start=1):
-            # 未知容器（初始样品与空容器都在 containers 表中）
-            for cid in (src, dst):
-                if cid not in touched:
-                    state = _load_state(conn, cid)
-                    if state is None:
-                        raise LineageError(
-                            404,
-                            "unknown_container",
-                            f"第 {index} 条转移中的容器 '{cid}' 不存在，整批拒绝",
-                        )
-                    touched[cid] = state
-
-            src_state = touched[src]
-            dst_state = touched[dst]
-            src_total = sum(src_state.values(), Decimal(0))
-
-            if volume == 0:
-                raise LineageError(
-                    422,
-                    "invalid_volume",
-                    f"第 {index} 条转移体积必须大于 0，整批拒绝",
-                )
-            if volume > src_total:
-                raise LineageError(
-                    422,
-                    "insufficient_volume",
-                    (
-                        f"第 {index} 条转移源液不足：'{src}' 当前 {src_total}，"
-                        f"请求 {volume}，整批拒绝"
-                    ),
-                )
-
-            # 按源容器“当时”的混合比例取出全部祖先来源
-            with localcontext() as ctx:
-                ctx.prec = settings.decimal_precision
-                taken = apportion(volume, src_state)
-
-            for sid, amount in taken.items():
-                src_state[sid] -= amount
-                dst_state[sid] = dst_state.get(sid, Decimal(0)) + amount
-                if src_state[sid] == 0:
-                    del src_state[sid]
-
+        touched, _ = _simulate_transfers(conn, prepared)
         _persist_states(conn, touched)
         conn.execute("COMMIT")
     except Exception:
@@ -239,15 +267,49 @@ def apply_transfers(
     return len(prepared)
 
 
+def preview_transfers(
+    conn: sqlite3.Connection, transfers: Iterable[tuple[str, str, Decimal]]
+) -> dict:
+    """预演一批转移：与真实提交完全相同的校验与分摊，但绝不写库。
+
+    在数据库当前状态上按数组顺序模拟，返回每步从各祖先来源扣取的精确份额，
+    以及全部受影响容器的最终体积与来源构成。无论成功或失败，数据库状态不变。
+    """
+    prepared = _prepare_transfers(transfers)
+
+    # 只读事务：保证多次读取落在同一快照；ROLLBACK 从结构上保证不落库
+    conn.execute("BEGIN")
+    try:
+        touched, taken_steps = _simulate_transfers(conn, prepared)
+        conn.execute("ROLLBACK")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    steps = [
+        {
+            "index": index,
+            "source": src,
+            "destination": dst,
+            "volume": volume,
+            "taken": [
+                {"source_id": sid, "amount": amount}
+                for sid, amount in sorted(taken_steps[index - 1].items())
+            ],
+        }
+        for index, (src, dst, volume) in enumerate(prepared, start=1)
+    ]
+    return {
+        "steps": steps,
+        "containers": [_format_state(cid, touched[cid]) for cid in sorted(touched)],
+    }
+
+
 # --------------------------------------------------------------------------- #
 # 查询
 # --------------------------------------------------------------------------- #
-def get_container_status(conn: sqlite3.Connection, cid: str) -> dict:
-    """返回容器当前体积与各祖先来源占比。"""
-    state = _load_state(conn, cid)
-    if state is None:
-        raise LineageError(404, "unknown_container", f"容器 '{cid}' 不存在")
-
+def _format_state(cid: str, state: State) -> dict:
+    """把容器状态格式化为查询接口与预演共用的输出结构。"""
     total = sum(state.values(), Decimal(0))
     q = Decimal(1).scaleb(-settings.proportion_scale)
     sources: list[dict] = []
@@ -274,3 +336,11 @@ def get_container_status(conn: sqlite3.Connection, cid: str) -> dict:
         "sources": sources,
         "proportion_scale": settings.proportion_scale,
     }
+
+
+def get_container_status(conn: sqlite3.Connection, cid: str) -> dict:
+    """返回容器当前体积与各祖先来源占比。"""
+    state = _load_state(conn, cid)
+    if state is None:
+        raise LineageError(404, "unknown_container", f"容器 '{cid}' 不存在")
+    return _format_state(cid, state)

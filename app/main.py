@@ -15,6 +15,7 @@ from .schemas import (
     ContainerIn,
     ContainerOut,
     ContainerStatusOut,
+    PreviewTransferOut,
     SampleIn,
     SampleOut,
 )
@@ -89,6 +90,19 @@ def batch_transfers(
     triples = [(t.source, t.destination, t.volume) for t in body.transfers]
     applied = service.apply_transfers(conn, triples)
     return {"applied": applied, "message": f"已依次提交 {applied} 条转移"}
+
+
+@app.post(
+    "/transfers/preview",
+    response_model=PreviewTransferOut,
+    tags=["transfers"],
+    summary="预演批量转移（相同校验与分摊，不写库）",
+)
+def preview_transfers(
+    body: BatchTransferIn, conn: sqlite3.Connection = Depends(get_db)
+) -> dict:
+    triples = [(t.source, t.destination, t.volume) for t in body.transfers]
+    return service.preview_transfers(conn, triples)
 
 
 @app.get(

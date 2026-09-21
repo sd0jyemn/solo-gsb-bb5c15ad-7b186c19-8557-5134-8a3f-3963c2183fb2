@@ -85,3 +85,25 @@ class ContainerOut(BaseModel):
 class BatchTransferOut(BaseModel):
     applied: int
     message: str
+
+
+class TakenOut(BaseModel):
+    source_id: str = Field(..., description="祖先初始样品 ID")
+    amount: DecimalStr = Field(..., description="本条转移从该来源实际扣取的精确份额")
+
+
+class TransferStepOut(BaseModel):
+    index: int = Field(..., description="转移在请求数组中的序号（从 1 开始）")
+    source: str = Field(..., description="源容器 ID")
+    destination: str = Field(..., description="目标容器 ID")
+    volume: DecimalStr = Field(..., description="本条转移的体积")
+    taken: list[TakenOut] = Field(
+        ..., description="按最大余额法从各祖先来源扣取的份额，之和精确等于体积"
+    )
+
+
+class PreviewTransferOut(BaseModel):
+    steps: list[TransferStepOut] = Field(..., description="按数组顺序逐步模拟的结果")
+    containers: list[ContainerStatusOut] = Field(
+        ..., description="全部受影响容器在模拟结束后的最终体积与来源构成（按 ID 排序）"
+    )

@@ -9,6 +9,8 @@
 - 一批转移**严格依次发生**：后面的转移能看到同批中前面转移的结果。
 - 整批是一个 SQLite 事务：**源液不足、未知容器、自转移**（或任何参数错误）都会导致
   **整批拒绝、状态完全不变**。
+- 提交前可用 `POST /transfers/preview` **预演**整批转移：相同的校验与分摊规则，
+  返回逐步明细与最终状态，**无论成功或失败都不写库**。
 - 可查询任一容器的**当前体积**以及各祖先初始样品的**来源占比**。
 
 ---
@@ -122,7 +124,72 @@ curl -X POST http://localhost:8000/transfers/batch \
 {"error":{"code":"insufficient_volume","message":"第 2 条转移源液不足：'V1' 当前 75.000000000，请求 9999.000000000，整批拒绝"}}
 ```
 
-### 4. 查询容器当前体积与来源占比
+### 4. 预演批量转移（模拟执行，不写库）
+
+`POST /transfers/preview` 接收与 `/transfers/batch` **完全相同的请求体**，在数据库
+**当前状态**上按数组顺序**模拟**整批转移（链式转移使用本批前序步骤的模拟结果），
+返回每一步从各祖先来源**实际扣取的精确份额**，以及全部受影响容器在模拟结束后的
+**最终体积与来源构成**。校验规则、最大余额分摊、错误码与条目序号与真实提交完全一致；
+**无论模拟成功或失败，数据库都不会有任何改变**。
+
+```bash
+curl -X POST http://localhost:8000/transfers/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"transfers":[
+    {"source":"S1","destination":"V1","volume":"40"},
+    {"source":"V1","destination":"V2","volume":"10"}
+  ]}'
+```
+
+```json
+{
+  "steps": [
+    {
+      "index": 1,
+      "source": "S1",
+      "destination": "V1",
+      "volume": "40.000000000",
+      "taken": [{"source_id": "S1", "amount": "40.000000000"}]
+    },
+    {
+      "index": 2,
+      "source": "V1",
+      "destination": "V2",
+      "volume": "10.000000000",
+      "taken": [{"source_id": "S1", "amount": "10.000000000"}]
+    }
+  ],
+  "containers": [
+    {
+      "container_id": "S1",
+      "volume": "60.000000000",
+      "sources": [{"source_id": "S1", "amount": "60.000000000", "proportion": "1.000000"}],
+      "proportion_scale": 6
+    },
+    {
+      "container_id": "V1",
+      "volume": "30.000000000",
+      "sources": [{"source_id": "S1", "amount": "30.000000000", "proportion": "1.000000"}],
+      "proportion_scale": 6
+    },
+    {
+      "container_id": "V2",
+      "volume": "10.000000000",
+      "sources": [{"source_id": "S1", "amount": "10.000000000", "proportion": "1.000000"}],
+      "proportion_scale": 6
+    }
+  ]
+}
+```
+
+- `steps[i].taken`：第 `index` 条转移按最大余额法从各祖先来源扣取的份额，
+  其和精确等于该条转移体积。
+- `containers`：本批触及的全部容器（按 ID 排序）在模拟结束后的状态，
+  格式与下面的查询接口一致。
+- 失败时返回与批量提交相同的错误结构（HTTP 状态码、`error.code`、条目序号均一致），
+  且同样不落库。
+
+### 5. 查询容器当前体积与来源占比
 
 ```bash
 curl http://localhost:8000/containers/V1
@@ -184,7 +251,7 @@ app/
   config.py     # 环境变量配置
   db.py         # SQLite 连接、建库（启动时执行）
   schemas.py    # Pydantic 请求/响应模型（Decimal <-> 字符串）
-  service.py    # 核心逻辑：登记、批量转移事务、比例分摊、查询
+  service.py    # 核心逻辑：登记、批量转移事务、预演模拟、比例分摊、查询
   main.py       # FastAPI 路由与错误处理
 tests/          # pytest 端到端与分摊算法测试
 Dockerfile
